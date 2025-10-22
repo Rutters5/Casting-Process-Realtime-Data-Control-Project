@@ -623,15 +623,12 @@ def calculate_p_chart_by_date(df):
     
     p_bar = date_stats['defects'].sum() / date_stats['total'].sum()
     
-    n_bar = date_stats['total'].mean()
-    
     sigma = np.sqrt(p_bar * (1 - p_bar) / n_bar)
     
-    UCL = p_bar + 3 * sigma
-    LCL = p_bar - 3 * sigma
-    LCL = max(0, LCL)
-    
-    return date_stats, p_bar, UCL, LCL
+    date_stats['UCL'] = p_bar + 3 * np.sqrt(p_bar * (1 - p_bar) / date_stats['total'])
+    date_stats['LCL'] = 0
+
+    return date_stats, p_bar
 
 def calculate_p_chart(df, subgroup_size=5):
     if 'passorfail' not in df.columns:
@@ -1261,11 +1258,18 @@ def tab_server(input, output, session):
             date_start = date_range[0] if date_range else None
             date_end = date_range[1] if date_range else None
             df = load_and_filter_data(date_start=date_start, date_end=date_end, mold_codes=mold_codes)
-            date_stats, p_bar, UCL, LCL = calculate_p_chart_by_date(df)
+            date_stats, p_bar = calculate_p_chart_by_date(df)
             display_data = date_stats
             x_column = 'date_only'
             x_label = '날짜'
             title = 'P 관리도 (날짜 기반)'
+            
+            has_vec_limits = all(col in display_data.columns for col in ['UCL', 'LCL'])
+            has_vec_warn   = all(col in display_data.columns for col in ['WARN_U', 'WARN_L'])
+
+            # 스칼라 백업값 없음
+            UCL_scalar = None
+            LCL_scalar = None
         else:
             df = load_and_filter_data(mold_codes=mold_codes)
             subgroup_size = filters["subgroup_size"]
@@ -1282,9 +1286,28 @@ def tab_server(input, output, session):
         if len(display_data) > 0 and analysis_mode == "subgroup":
             ax.set_xlim(display_data[x_column].min() - 1, display_data[x_column].max() + 1)
 
-        warn_upper = p_bar + (UCL - p_bar) * 2/3
-        warn_lower = p_bar - (p_bar - LCL) * 2/3
-        out_of_control = (display_data['p'] > UCL) | (display_data['p'] < LCL)
+        if has_vec_warn:
+            warn_upper = display_data['WARN_U']
+            warn_lower = display_data['WARN_L']
+        else:
+            if has_vec_limits:
+                # 벡터 한계선이 있으면 점별 2/3 규칙 적용
+                warn_upper = p_bar + (display_data['UCL'] - p_bar) * (2.0/3.0)
+                warn_lower = p_bar - (p_bar - display_data['LCL']) * (2.0/3.0)
+            else:
+                # 스칼라만 있을 때
+                if UCL_scalar is None or LCL_scalar is None:
+                    raise ValueError("UCL/LCL not provided as vector columns or scalar values.")
+                warn_upper = p_bar + (UCL_scalar - p_bar) * (2.0/3.0)
+                warn_lower = p_bar - (p_bar - LCL_scalar) * (2.0/3.0)
+
+        # -----------------------------
+        # 관리 상태 판정
+        # -----------------------------
+        if has_vec_limits:
+            out_of_control = (display_data['p'] > display_data['UCL']) | (display_data['p'] < display_data['LCL'])
+        else:
+            out_of_control = (display_data['p'] > UCL_scalar) | (display_data['p'] < LCL_scalar)
 
         ax.plot(display_data[x_column], display_data['p'], color='#2E86AB', linewidth=2, linestyle='-', zorder=2)
         ax.scatter(display_data.loc[~out_of_control, x_column], display_data.loc[~out_of_control, 'p'],
