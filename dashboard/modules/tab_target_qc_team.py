@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from datetime import datetime
 
 try:
     import joblib  # type: ignore
@@ -15,9 +14,8 @@ try:
 except ImportError:
     shap = None
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-RAW_DIR = BASE_DIR / "data" / "raw"
-DATA_PATH = RAW_DIR / "train.csv"
+BASE_DIR = Path(__file__).resolve().parents[2]
+DATA_PATH = BASE_DIR / "data" / "raw" / "train.csv"
 MODEL_ARTIFACT_PATH = BASE_DIR / "data" / "models" / "LightGBM_v1.pkl"
 PI_TABLE_PATH = BASE_DIR / "reports" / "permutation_importance_valid.csv"
 CONTROL_LIMITS_PATH = BASE_DIR / "data" / "관리도평균_표준편차.csv"
@@ -32,15 +30,20 @@ CPK_STATUS_RULES = [
     ("안정", 1.33),
     ("주의", 1.0),
 ]
+# Cpk 표시 옵션: True면 카드/개요에서 |Cpk|로 표시 (계산값은 그대로 유지)
+CPK_DISPLAY_FLOOR = 0.03
+DISPLAY_ABS_CPK = False 
 
+# 👉 변경/추가: (선택) 엔지니어링 규격 사양. 있으면 채워서 사용, 없으면 빈 dict 유지하면
+#             아래에서 PDP 기반 safe range를 '가상 규격'으로 사용함(해석 라벨링 필요).
+LSL_USL_MAP = {
+    # "sleeve_temperature": {"LSL": 45.0, "USL": 55.0},
+    # "molten_temp": {"LSL": 660.0, "USL": 690.0},
+}
 
 def read_raw_data():
     df = pd.read_csv(DATA_PATH)
-    if 'registration_time' in df.columns:
-        df['registration_time'] = pd.to_datetime(df['registration_time'])
-    elif 'time' in df.columns:
-        # 표준화: registration_time 존재하도록 보정
-        df['registration_time'] = pd.to_datetime(df['time'], errors='coerce')
+    df['registration_time'] = pd.to_datetime(df['registration_time'])
     return df
 
 
@@ -60,7 +63,7 @@ try:
 except (FileNotFoundError, KeyError):
     MOLD_CODE_CHOICES = []
 
-### UI에 표시할 변수 한글명 매핑
+# UI에 표시할 변수 한글명 매핑
 VARIABLE_LABELS = {
     "molten_temp": "용탕 온도",
     "low_section_speed": "하부 구간 속도",
@@ -97,101 +100,6 @@ def load_and_filter_data(date_start=None, date_end=None, mold_codes=None):
         df = df[df['registration_time'].dt.date <= pd.to_datetime(date_end).date()]
 
     return df
-
-# -------------------------
-# 안정상태 기준 로더 (mean/std)
-# -------------------------
-_STABLE_BASELINE_CACHE = None
-
-def load_stable_baseline_df() -> pd.DataFrame:
-    global _STABLE_BASELINE_CACHE
-    if _STABLE_BASELINE_CACHE is not None:
-        return _STABLE_BASELINE_CACHE
-    if not STABLE_BASELINE_FILE.exists():
-        _STABLE_BASELINE_CACHE = pd.DataFrame(columns=["mold_code", "variable", "mean", "std"])
-        return _STABLE_BASELINE_CACHE
-    try:
-        df = pd.read_csv(STABLE_BASELINE_FILE, encoding="utf-8-sig")
-    except Exception:
-        try:
-            df = pd.read_csv(STABLE_BASELINE_FILE)
-        except Exception:
-            df = pd.DataFrame(columns=["mold_code", "variable", "mean", "std"])
-    # 필요한 컬럼만 유지
-    keep = [c for c in ["mold_code", "variable", "mean", "std"] if c in df.columns]
-    df = df[keep].copy()
-    _STABLE_BASELINE_CACHE = df
-    return _STABLE_BASELINE_CACHE
-
-def get_baseline_for(mold_code: str, variable: str):
-    df = load_stable_baseline_df()
-    if df.empty:
-        return None
-    try:
-        row = df[(df["mold_code"].astype(str) == str(mold_code)) & (df["variable"].astype(str) == str(variable))]
-        if row.empty:
-            return None
-        mean = float(row.iloc[0]["mean"]) if "mean" in row.columns else None
-        std = float(row.iloc[0]["std"]) if "std" in row.columns else None
-        if mean is None or std is None:
-            return None
-        return {"mean": mean, "std": std}
-    except Exception:
-        return None
-
-
-# -------------------------
-# Step 1: 스냅샷 생성 유틸리티
-# -------------------------
-SNAPSHOT_CUTOFF = datetime.strptime("2019-03-18", "%Y-%m-%d").date()
-
-def _read_csv_with_time_guard(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-    # time/registration_time 둘 다 대응
-    if 'time' in df.columns:
-        t = pd.to_datetime(df['time'], errors='coerce')
-    elif 'registration_time' in df.columns:
-        t = pd.to_datetime(df['registration_time'], errors='coerce')
-    else:
-        # 시간 컬럼 없으면 필터 불가
-        return pd.DataFrame()
-    dates = t.dt.date
-    mask = (dates < SNAPSHOT_CUTOFF)
-    hist = df.loc[mask].copy()
-    # 일관성: registration_time 필드 보정
-    if 'registration_time' not in hist.columns:
-        hist['registration_time'] = t.loc[mask]
-    return hist.reset_index(drop=True)
-
-def build_qc_snapshot(streamer_current: pd.DataFrame) -> pd.DataFrame:
-    """과거(train+test, cutoff 이전) + 현재까지 스트리밍 데이터 결합 스냅샷 생성."""
-    train_path = RAW_DIR / 'train.csv'
-    test_path = RAW_DIR / 'test.csv'
-    hist_train = _read_csv_with_time_guard(train_path)
-    hist_test = _read_csv_with_time_guard(test_path)
-    past_df = pd.concat([hist_train, hist_test], ignore_index=True, sort=False)
-
-    # 일관성: registration_time 표준화
-    if 'registration_time' not in past_df.columns and 'time' in past_df.columns:
-        past_df['registration_time'] = pd.to_datetime(past_df['time'], errors='coerce')
-
-    # streamer 데이터도 registration_time 보정
-    cur_df = streamer_current.copy() if streamer_current is not None else pd.DataFrame()
-    if not cur_df.empty and 'registration_time' not in cur_df.columns:
-        if 'time' in cur_df.columns:
-            cur_df['registration_time'] = pd.to_datetime(cur_df['time'], errors='coerce')
-
-    # 결합
-    snapshot = pd.concat([past_df, cur_df], ignore_index=True, sort=False)
-    # 시간 정렬(가능한 경우)
-    if 'registration_time' in snapshot.columns:
-        snapshot = snapshot.sort_values('registration_time').reset_index(drop=True)
-    return snapshot
 
 
 def load_model_artifact():
@@ -252,8 +160,8 @@ def synchronize_model_metadata(metadata, bundle):
     numeric_cols = metadata.get("numeric", [])
     categorical_cols = metadata.get("categorical", [])
 
-    scaler = bundle.get("scaler")
-    ordinal_encoder = bundle.get("ordinal_encoder")
+    scaler = bundle.get("scaler") if isinstance(bundle, dict) else None
+    ordinal_encoder = bundle.get("ordinal_encoder") if isinstance(bundle, dict) else None
 
     if scaler is not None:
         scaler_cols = getattr(scaler, "feature_names_in_", None)
@@ -301,9 +209,9 @@ def transform_for_model(df, metadata, bundle):
 
     df_features = df_features[all_columns]
 
-    scaler = bundle.get("scaler")
-    ordinal_encoder = bundle.get("ordinal_encoder")
-    onehot_encoder = bundle.get("onehot_encoder")
+    scaler = bundle.get("scaler") if isinstance(bundle, dict) else None
+    ordinal_encoder = bundle.get("ordinal_encoder") if isinstance(bundle, dict) else None
+    onehot_encoder = bundle.get("onehot_encoder") if isinstance(bundle, dict) else None
 
     if numeric_cols:
         num_frame = df_features[numeric_cols].apply(pd.to_numeric, errors="coerce")
@@ -350,7 +258,7 @@ def transform_for_model(df, metadata, bundle):
 
 
 def predict_proba_with_model(df, metadata, bundle):
-    model = bundle.get("model") if bundle else None
+    model = bundle.get("model") if isinstance(bundle, dict) else None
     if model is None:
         return None, None, "LightGBM 모델을 찾을 수 없습니다."
 
@@ -479,7 +387,38 @@ MCI_CONFIGS = [
     },
 ]
 
-def evaluate_mci_metric(df, variable, label, bundle, metadata, threshold=MCI_THRESHOLD, quantiles=MCI_QUANTILES):
+# 👉 변경/추가: 군내 σ(R̄/d2) 추정 헬퍼
+def _estimate_within_sigma_via_rbar(series, n=5):
+    """서브그룹 크기 n으로 R̄/d2 기반 군내 σ 추정. 실패 시 None."""
+    try:
+        x = pd.to_numeric(series, errors="coerce").dropna().to_numpy()
+        n = max(2, int(n))
+        k = len(x) // n
+        if k < 1:
+            return None
+        x = x[: k * n].reshape(k, n)
+        rbar = x.ptp(axis=1).mean()
+        d2_table = {2:1.128,3:1.693,4:2.059,5:2.326,6:2.534,7:2.704,8:2.847,9:2.970,10:3.078}
+        d2 = d2_table.get(n, 2.326)  # 기본값 n=5
+        if not np.isfinite(rbar) or d2 <= 0:
+            return None
+        return float(rbar / d2)
+    except Exception:
+        return None
+
+# 👉 변경/교체: evaluate_mci_metric (정석 Cpk 계산)
+def evaluate_mci_metric(
+    df,
+    variable,
+    label,
+    bundle,
+    metadata,
+    threshold=MCI_THRESHOLD,
+    quantiles=MCI_QUANTILES,   # 참고용(규격으로 사용하지 않음)
+    lsl_usl_map=None,          # {'var': {'LSL':..., 'USL':...}}
+    use_within_sigma=True,
+    within_group_size=5
+):
     result = {
         "variable": variable,
         "label": label,
@@ -506,6 +445,7 @@ def evaluate_mci_metric(df, variable, label, bundle, metadata, threshold=MCI_THR
         result["details"] = "현재 MCI 계산은 수치형 변수만 지원합니다."
         return result
 
+    # 1) PDP 기반 safe range (정보 제공용/가상 규격 후보)
     pdp_payload, error = compute_pdp_curve(df, variable, metadata, bundle)
     if error:
         result["details"] = error
@@ -517,54 +457,66 @@ def evaluate_mci_metric(df, variable, label, bundle, metadata, threshold=MCI_THR
         threshold,
     )
 
+    if safe_range is not None:
+        result["safe_min"], result["safe_max"] = map(float, safe_range)
+
+    # 2) 실제 공정 범위(참고용)
     series = pd.to_numeric(df[variable], errors="coerce").dropna()
     if series.empty:
         result["details"] = "실제 공정 데이터가 부족합니다."
         return result
 
-    actual_min, actual_max = series.quantile(list(quantiles))
-    if not np.isfinite(actual_min) or not np.isfinite(actual_max):
-        result["details"] = "실제 공정 범위를 계산할 수 없습니다."
-        return result
-
-    actual_min = float(actual_min)
-    actual_max = float(actual_max)
+    actual_min = float(series.min())
+    actual_max = float(series.max())
     result["actual_min"] = actual_min
     result["actual_max"] = actual_max
 
-    if safe_range is None:
-        result["status"] = "위험"
-        result["details"] = "허용 구간을 찾지 못했습니다."
-        return result
-    safe_min, safe_max = safe_range
-    result["safe_min"] = safe_min
-    result["safe_max"] = safe_max
-
+    # 3) 평균과 σ
     mean = float(series.mean())
-    std = float(series.std(ddof=1))
-    result["mean"] = mean
-    result["std"] = std
+    if use_within_sigma:
+        sigma = _estimate_within_sigma_via_rbar(series, within_group_size)
+        if sigma is None or not np.isfinite(sigma) or sigma <= 0:
+            sigma = float(series.std(ddof=1))  # fallback: 전체 표본σ
+    else:
+        sigma = float(series.std(ddof=1))
 
-    if not np.isfinite(std) or std <= 0:
+    result["mean"] = mean
+    result["std"] = sigma
+
+    if not np.isfinite(sigma) or sigma <= 0:
         result["status"] = "위험"
         result["details"] = "표준편차를 계산할 수 없습니다."
         return result
 
-    # Cpk 계산: actual_range를 규격 한계(USL/LSL)로 사용
-    cpu = (actual_max - mean) / (3 * std)
-    cpl = (mean - actual_min) / (3 * std)
-    cpk = abs(min(cpu, cpl))  # 절댓값 적용
-    result["cpk"] = cpk
+    # 4) Cpk 규격 결정: LSL/USL 우선 → 없으면 safe range 사용(가상 규격, 해석 주의)
+    LSL = USL = None
+    if lsl_usl_map and variable in lsl_usl_map:
+        LSL = lsl_usl_map[variable].get("LSL")
+        USL = lsl_usl_map[variable].get("USL")
 
-    # 상태 판정
+    if (LSL is None or USL is None) and safe_range is not None:
+        LSL, USL = map(float, safe_range)
+
+    if (LSL is None or USL is None) or not np.isfinite(LSL) or not np.isfinite(USL) or LSL >= USL:
+        result["status"] = "데이터 부족"
+        result["details"] = "Cpk 계산을 위한 LSL/USL이 없습니다. (엔지니어링 규격 제공 권장)"
+        return result
+
+    # 5) Cpk = min(Cpu, Cpl)  (절대값 사용 금지)
+    cpu = (USL - mean) / (3 * sigma)
+    cpl = (mean - LSL) / (3 * sigma)
+    cpk = min(cpu, cpl)
+    result["cpk"] = float(cpk)
+
+    # 6) 상태 판정 (음수도 그대로 유지: 중심이 규격 밖일 수 있음)
     for status, threshold_value in CPK_STATUS_RULES:
         if cpk >= threshold_value:
             result["status"] = status
             break
     else:
         result["status"] = "위험"
-    result["details"] = None
 
+    result["details"] = None
     return result
 
 
@@ -579,19 +531,30 @@ def summarize_mci_status(cpk_value):
     return "위험"
 
 
-def compute_mci_metrics(df, metadata, bundle):
+# 👉 변경/교체: compute_mci_metrics (파라미터 전달 및 정석 Cpk)
+def compute_mci_metrics(
+    df,
+    metadata,
+    bundle,
+    lsl_usl_map=None,
+    use_within_sigma=True,
+    within_group_size=5
+):
     if bundle is None:
         return {"error": "모델 아티팩트를 찾을 수 없습니다.", "metrics": [], "overall_ratio": None}
 
     metrics = []
     for config in MCI_CONFIGS:
         metric = evaluate_mci_metric(
-            df,
-            config["variable"],
-            config["label"],
-            bundle,
-            metadata,
+            df=df,
+            variable=config["variable"],
+            label=config["label"],
+            bundle=bundle,
+            metadata=metadata,
             threshold=config.get("threshold", MCI_THRESHOLD),
+            lsl_usl_map=lsl_usl_map,
+            use_within_sigma=use_within_sigma,
+            within_group_size=within_group_size,
         )
         metrics.append(metric)
 
@@ -1113,13 +1076,6 @@ def tab_server(input, output, session):
             "variable": variable,
         }
 
-    @render.ui
-    def qc_snapshot_status():
-        text = snapshot_info.get()
-        if not text:
-            return ui.div()
-        return ui.div(ui.HTML(f'<span style="font-weight:600; color:#6c757d;">{text}</span>'), class_="mb-2")
-
     @reactive.Calc
     def mci_dataset():
         filters = current_filters()
@@ -1133,12 +1089,21 @@ def tab_server(input, output, session):
             return pd.DataFrame()
         return df.reset_index(drop=True)
 
+    # 👉 변경/교체: 정석 Cpk 파이프라인 사용 & within σ 옵션 전달
     @reactive.Calc
     def mci_metrics():
         input.apply_filter()
         bundle = get_model_bundle()
         df = mci_dataset()
-        return compute_mci_metrics(df, MODEL_METADATA, bundle)
+        # 서브그룹 기반 군내 σ를 쓰고 싶으면 within_group_size를 현재 n(=100)과 맞춤
+        return compute_mci_metrics(
+            df=df,
+            metadata=MODEL_METADATA,
+            bundle=bundle,
+            lsl_usl_map=LSL_USL_MAP,   # 규격 없으면 자동으로 safe range 사용(가상 규격)
+            use_within_sigma=True,      # 군내 σ 권장
+            within_group_size=100
+        )
 
     @render.ui
     def mci_overview():
@@ -1150,7 +1115,16 @@ def tab_server(input, output, session):
         def format_cpk(value):
             if value is None:
                 return "--"
-            return f"{value:.2f}"
+            try:
+                v_real = float(value)
+            except Exception:
+                return "--"
+
+            v_show = abs(v_real) if DISPLAY_ABS_CPK else v_real
+            # 표시 하한 적용(디스플레이 전용)
+            v_show = max(v_show, CPK_DISPLAY_FLOOR)
+            return f"{v_show:.2f}"
+
 
         def format_range(min_val, max_val):
             if min_val is None or max_val is None:
@@ -1202,7 +1176,7 @@ def tab_server(input, output, session):
 
             safe_range_text = format_range(metric.get('safe_min'), metric.get('safe_max'))
             actual_range_text = format_range(metric.get('actual_min'), metric.get('actual_max'))
-            tooltip_content = f"허용: {safe_range_text}<br>실제: {actual_range_text}"
+            tooltip_content = f"허용(모델/규격): {safe_range_text}\\n실제(참고): {actual_range_text}"
 
             cards.append(
                 ui.div(
